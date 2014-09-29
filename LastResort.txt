@@ -1,0 +1,425 @@
+public package singlejartest;
+
+import java.io.DataOutputStream;
+
+import java.io.DataInputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileNotFoundException;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.PrintWriter;
+import java.text.ParseException;
+import java.util.*;
+import com.dukascopy.api.IBar;
+import com.dukascopy.api.Instrument;
+import com.dukascopy.api.JFException;
+import com.dukascopy.api.OfferSide;
+import com.dukascopy.api.Period;
+
+import com.dukascopy.api.*;
+
+public class HFTStrategy implements IStrategy {
+    
+    // This defines a particular order
+    class OrderSet {
+        Instrument inst[];
+        IOrder order[];
+        boolean is_buy;
+        double open_price;
+        double weight;
+                
+        public void Close() throws JFException {
+        	for(IOrder o : order) {
+        		if(o.getState() != IOrder.State.CLOSED && o.getState() != IOrder.State.CANCELED) {
+        			o.close();
+        		}
+        	}
+        }
+        
+        public void CloseStop() throws JFException {
+        	for(IOrder o : order) {
+        		if(o.getProfitLossInAccountCurrency() > -100 * (account.getEquity() / 5000)) {
+        			continue;
+        		}
+        		
+        		if(o.getState() != IOrder.State.CLOSED && o.getState() != IOrder.State.CANCELED) {
+        			o.close();
+        		}
+        	}
+        }
+        
+        public double PipDelta(double vector[]) {
+        	
+        	int offset = 0;
+        	double delta = 0;
+        	for(IOrder o : order) {
+        		delta += Math.abs(vector[offset++]) * o.getProfitLossInPips();
+        	}
+        	
+        	return delta;	
+        }
+        
+        public double NetProfit() {
+        	
+        	double net_profit = 0;
+        	for(IOrder o : order) {
+        		net_profit += o.getAmount() * o.getProfitLossInPips();
+        	}
+        	
+        	return net_profit;
+        }
+    }
+    
+    class PricePoint {
+        OrderSet order;
+        int order_num = 0;
+        double price;
+        
+        public PricePoint(OrderSet o, int order_num) {
+            order = o;
+            this.order_num = order_num;
+        }
+    }
+    
+    private IEngine engine;
+    private IConsole console;
+    private IHistory history;
+    private IContext context;
+    private IIndicators indicators;
+    private IUserInterface userInterface;
+    private IConsole con = null;
+    private static IAccount account;
+    
+    public int combo[][] = {{0,3,2,4},{0,3,2,4}};
+    public double hedge[][] = {{1.8034887352105216,1.581826517492118,-1.7331336295128494,-0.6521816231900175},{1.8034887352105216,1.581826517492118,-1.7331336295128494,-0.6521816231900175}};
+    public double barrier[] = {0.23700864502069566,0.23700864502069566};
+    public Instrument instruments[] = {Instrument.AUDCAD,Instrument.AUDCHF,Instrument.AUDNZD,Instrument.CADCHF,Instrument.GBPUSD};
+    // This stores the current order id
+	private int order_id = 0;
+    
+    class Strategy { 
+	   // This stores the set of global orders
+	   private HashSet<OrderSet> orders = new HashSet<OrderSet>();
+	   // This stores the set of global orders
+	   private Queue<OrderSet> order_queue = new LinkedList<OrderSet>();
+	   //This stores the recent price queue
+	   private Queue<Double> price_queue = new LinkedList<Double>();
+	   // This stores the price
+	   private HashMap<Integer, Long> price_level_map  = new HashMap<Integer, Long>();
+	   // This stores the account equity
+	   private ArrayList<Double> equity_buff = new ArrayList<Double>();
+	   // This stores the start time
+	   private long start_time;
+	   // This stores the starting delta
+	   private double init_delta = 0;
+	   // This stores the open price
+	   private double open_price;
+	   // This stores the previous trade time
+	   private long last_trade_time = 0;
+	   // This stores the previous tick time
+	   private long last_tick_time = 0;
+	   // This stores the previous frequency
+	   private double prev_freq = 0;
+	   
+	   private static final int PRICE_WIDTH = 10;
+	   private double start_equity;
+	   
+	   // This makes an order
+	   private void PlaceOrder(OrderSet o, double volume, double weight[]) throws JFException {
+
+	       
+	       for(int i=0; i<o.inst.length; i++) {
+	    	   
+	    	   double vol = Math.max(volume * Math.abs(weight[i]), 0.001);
+	       
+		       if(o.is_buy == false) {
+		           o.order[i] = engine.submitOrder("abeq"+String.valueOf(order_id++), o.inst[i],
+		        		   weight[i] > 0 ? IEngine.OrderCommand.SELL : IEngine.OrderCommand.BUY, vol);
+		       } else {
+		    	   o.order[i] = engine.submitOrder("abeq"+String.valueOf(order_id++), o.inst[i],
+		        		   weight[i] > 0 ? IEngine.OrderCommand.BUY : IEngine.OrderCommand.SELL, vol);
+		       }
+	       }
+	   }
+	   
+	   public void CloseAll() throws JFException {
+		   
+		   for(OrderSet o : orders) {
+			   o.Close();
+		   }
+		   
+		   orders.clear();
+	   }
+	   
+	   private double[] discreteFT(double[] data, int N, boolean forward) { 
+			double X[] = new double[2*N]; 
+			double omega; int k, ki, kr, n;  
+			// If this is a inverse transform, reverse the // sign of the angle so the sin() terms will // change sign.  
+			if (forward) { omega = 2.0*Math.PI/N; } else { omega = -2.0*Math.PI/N; }  
+			// Perform the discrete Fourier transform. // The real and imaginary data are stored in the // x[] and X[] vectors as pairs, one real and // one imaginary value for each sample point.  
+			for(k=0; k<N; ++k) { kr = 2*k; ki = 2*k + 1; X[kr] = 0.0; X[ki] = 0.0; for(n=0; n<N; ++n) { X[kr] += data[2*n]*Math.cos(omega*n*k) + data[2*n+1]*Math.sin(omega*n*k); X[ki] += -data[2*n]*Math.sin(omega*n*k) + data[2*n+1]*Math.cos(omega*n*k); } }  
+			// If this is a forward transform, multiply // in the 1/N terms  
+			if ( forward ) { for(k=0; k<N; ++k) { X[2*k] /= N; X[2*k + 1] /= N; } }  
+			// Return the transformed data.  
+			
+			return X; 
+			
+
+		} 
+	   
+	   // This finds the frequency response
+	   private double FindFreqResponse() {
+		   
+		   double buff[] = new double[price_queue.size() << 1];
+		   int offset = 0;
+		   
+		   for(double p : price_queue) {
+			   buff[offset++] = p;
+			   buff[offset++] = p;
+		   }
+		   
+		   double out[] = discreteFT(buff, buff.length >> 1, true);
+		   double sum = 0;
+		   for(int i=0; i<out.length; i+=2) {
+			   sum += Math.sqrt((out[i] * out[i]) + (out[i+1] * out[i+1]));
+		   }
+		   
+		   double pos = 0;
+		   for(int i=0; i<out.length; i+=2) {
+			   double val = Math.sqrt((out[i] * out[i]) + (out[i+1] * out[i+1])) / sum;
+			   pos += val * i;
+		   }
+		   
+		   return pos / (out.length >> 1);
+	   }
+	   
+	   public void ProcessTick(ITick tick, double fvector[], int inst_id[], double barrier) throws JFException {
+		   
+		   Double price[] = new Double[inst_id.length];
+		   Instrument inst[] = new Instrument[inst_id.length];
+		   for(int i=0; i<inst_id.length; i++) {
+			   price[i] = last_price_map.get(instruments[inst_id[i]]);
+			   inst[i] = instruments[inst_id[i]];
+		   }
+		   
+		   for(Double d : price) {
+			   if(d == null) {
+				   return;
+			   }
+		   }
+		   
+		   double weight = 0;
+		   for(int i=0; i<price.length; i++) {
+			   weight += price[i] * fvector[i];
+		   }
+		   
+		   double pip_val = (tick.getAsk() + tick.getBid()) / 2;
+           
+           double pos_num = 0;
+           double neg_num = 0;
+           double net_pos_gap = 0;
+           double net_neg_gap = 0;
+           
+           double net_gap = 0;
+           double min_profit = 0;
+           double max_profit = -Double.MAX_VALUE;
+           double net_profit = 0;
+           double net_vol = 0;
+           double avg_time = 0;
+           
+
+           ArrayList<OrderSet> order_buff = new ArrayList<OrderSet>();
+           for(OrderSet o : orders) {
+               order_buff.add(o);
+           }
+           
+           for(int i=0; i<order_buff.size(); i++) {
+               
+               OrderSet o = order_buff.get(i);
+               if(o.order[0].getState() == IOrder.State.CANCELED || o.order[0].getState() == IOrder.State.CLOSED) {
+                   o.Close();
+                   orders.remove(o);
+                   order_queue.remove(o);
+                   continue;
+               }
+
+               if(o.order[0].getFillTime() > start_time) {
+                   avg_time += Math.abs(o.order[0].getFillTime() - start_time);
+               }
+               
+               if(o.NetProfit() < 0) {
+                    net_neg_gap += Math.abs(o.PipDelta(fvector));
+                    neg_num++;
+               }
+               
+           }
+           
+           if(orders.size() > 0) {
+               avg_time /= orders.size();
+           }
+           
+           if(net_neg_gap > 0) {
+               net_neg_gap /= neg_num;
+           }
+           net_gap = net_neg_gap;
+
+		   if(orders.size() == 0) {
+			   
+               if(account.getUseOfLeverage() > 5) {
+                   //return;
+               }
+               
+			   open_price = weight;
+			   price_level_map.clear();
+			   start_time = tick.getTime();
+			   init_delta = weight;
+			   start_equity = account.getEquity();
+			   order_queue.clear();
+			   orders.clear();
+		   }
+
+		   System.out.println(account.getEquity()+"  "+weight+" "+Math.abs(net_gap));
+		   
+		   if((account.getEquity() / start_equity) > 1.001 && (Math.abs(tick.getTime() - start_time) > 1000 * 60 * 60 * 12 || account.getUseOfLeverage() > 50)) {
+			   CloseAll();
+			   return;
+		   }
+		   
+		   /*if((account.getEquity() / start_equity) > 1.05) {
+			   CloseAll();
+			   System.out.println(account.getEquity()+"  "+weight);
+			   return;
+		   }*/
+		   
+		   if(Math.abs(tick.getTime() - last_trade_time) < 1000 * 60 * 10) {
+			   return;
+		   }
+		   
+		   int val = (int) (weight * 100);
+		   Long last_time = price_level_map.get(val);
+		   if(last_time != null && Math.abs(tick.getTime() - last_time) < 1000 * 60 * 60 * 10) {
+			   return;
+		   }
+		   
+		   OrderSet o = new OrderSet();
+		   o.is_buy = weight < 0;
+		   o.weight = weight;
+		   o.inst = inst;
+		   o.order = new IOrder[inst.length];
+		   
+		   double vol_size = (account.getEquity() / 100000);
+		   double volume = 0.0000001 * vol_size;
+           volume *= Math.abs(net_gap);
+           volume *= orders.size();
+           volume *= orders.size();
+           volume *= orders.size();
+           volume *= Math.max(1, Math.abs(avg_time) * 10e-8);
+           
+		   PlaceOrder(o, volume, fvector);
+		   orders.add(o);
+		   order_queue.add(o);
+		   
+		   if(order_queue.size() > 10) {
+			   OrderSet o1 = order_queue.remove();
+			   o1.Close();
+			   orders.remove(o1);
+		   }
+
+		   price_level_map.put(val, tick.getTime());
+		   last_trade_time = tick.getTime();
+	   }
+	   
+    };
+
+    private HashMap<Instrument, Double> last_price_map = new HashMap<Instrument, Double>();
+    private Strategy strategy[] = new Strategy[combo.length];
+
+   public HFTStrategy() throws IOException, ParseException, JFException {
+
+   }
+   
+   public void onStart(final IContext context) throws JFException {
+       
+       this.engine = context.getEngine();
+       this.console = context.getConsole();
+       this.history = context.getHistory();
+       this.context = context;
+       this.indicators = context.getIndicators();
+       this.userInterface = context.getUserInterface();
+       this.con = context.getConsole();
+       this.account = context.getAccount();
+
+       try {
+			DataInputStream os = new DataInputStream(new FileInputStream("rule_set"));
+			
+			while(os.available() > 0) {
+				Rule r = new Rule();
+				r.ReadRule(os);
+				if(r.up_num + r.down_num < 2) {
+					//continue;
+				}
+				
+			}
+		} catch (FileNotFoundException e) {
+			// TODO Auto-generated catch block
+			e.printStackTrace();
+		} catch (IOException e) {
+			// TODO Auto-generated catch block
+			e.printStackTrace();
+		}
+       
+       for(int i=0; i<strategy.length; i++) {
+    	   strategy[i] = new Strategy();
+       }
+
+       //subscribe an instrument:
+       Set<Instrument> inst = new HashSet<Instrument>();
+       
+       for(int i=0; i<instruments.length; i++) {
+    	   inst.add(instruments[i]);    
+       }  
+                  
+       context.setSubscribedInstruments(inst, true);  
+
+   }
+
+   public void onAccount(IAccount account) throws JFException {
+   }
+
+   public void onMessage(IMessage message) throws JFException {
+   }
+
+   public void onStop() throws JFException {
+       console.getOut().println("Stopped "+account.getEquity());
+       
+       /*PrintWriter pw = null;
+       try {
+           pw = new PrintWriter(new File("test.txt"));
+           for(int i=0; i<equity_buff.size(); i++) {
+               
+               pw.println(equity_buff.get(i));
+           }
+           pw.close();
+           
+       } catch (FileNotFoundException e) {
+           // TODO Auto-generated catch block
+           e.printStackTrace();
+       }*/
+   }
+   
+
+   public void onTick(Instrument instrument, ITick tick) throws JFException {
+	   
+	   last_price_map.put(instrument, tick.getBid());
+	   
+	   for(int i=0; i<strategy.length; i++) {
+		   strategy[i].ProcessTick(tick, hedge[i], combo[i], barrier[i]);
+	   }
+   }
+   
+   public void onBar(Instrument instrument, Period period, IBar askBar, IBar bidBar) throws JFException {
+   }
+}
+                
+  

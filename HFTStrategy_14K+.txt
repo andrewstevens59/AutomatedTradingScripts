@@ -1,0 +1,884 @@
+public package singlejartest;
+
+import java.io.DataOutputStream;
+
+import java.io.DataInputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileNotFoundException;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.PrintWriter;
+import java.text.ParseException;
+import java.util.*;
+import com.dukascopy.api.IBar;
+import com.dukascopy.api.Instrument;
+import com.dukascopy.api.JFException;
+import com.dukascopy.api.OfferSide;
+import com.dukascopy.api.Period;
+
+import com.dukascopy.api.*;
+
+public class HFTStrategy implements IStrategy {
+    
+    // This defines a particular order
+    class OrderSet {
+        double price;
+        double volume;
+        double max_pip_profit = -Double.MAX_VALUE;
+        double min_pip_profit = Double.MAX_VALUE;
+        boolean is_buy;
+        IOrder order;
+        OrderSystem system;
+        double total_orders;
+        boolean is_close = false;
+        long trade_time;
+    }
+    
+    class PricePoint {
+        OrderSet order;
+        int order_num = 0;
+        
+        public PricePoint(OrderSet o, int order_num) {
+            order = o;
+            this.order_num = order_num;
+        }
+    }
+    
+    private IEngine engine;
+    private IConsole console;
+    private IHistory history;
+    private IContext context;
+    private IIndicators indicators;
+    private IUserInterface userInterface;
+    private IConsole con = null;
+    private static IAccount account;
+    
+    // This stores the current equity
+    private double curr_equity = 0;
+    // This store the previous recorded equity time
+    private double prev_equity_time = 0;
+    
+    // This closes outstanding orders
+    public static boolean CloseOutstanding() {
+        
+        if(account.getUseOfLeverage() < 190) {
+            return true;
+        }
+        
+        double total_amount = 0;
+        ArrayList<OrderSet> order_buff = new ArrayList<OrderSet>();
+        for(OrderSet o : global_orders) {
+            if(o.order.getProfitLossInUSD() < 0) {
+                order_buff.add(o);
+                total_amount += o.order.getAmount();
+            }
+        }
+        
+        // highest to lowest
+        Collections.sort(order_buff, new Comparator<OrderSet>() {
+             
+            public int compare(OrderSet arg1, OrderSet arg2) {
+                
+                if(arg1.order.getAmount() < arg2.order.getAmount()) {
+                    return 1;
+                }
+
+                if(arg1.order.getAmount() > arg2.order.getAmount()) {
+                    return -1;
+                }
+                
+
+                return 0; 
+            }
+        });
+
+        double amount = 0;
+        int offset = order_buff.size()-1;
+        while(amount < total_amount * 0.5) {
+            OrderSet o = order_buff.get(offset);
+            o.system.CloseOrder(o);
+            amount += o.order.getAmount();
+            offset--;
+        }
+        
+        return true; 
+    }
+    
+    // This stores the order direction queue
+    private Queue<Integer> dir_queue = new LinkedList<Integer>();
+
+    class OrderSystem {
+        // This stores the current order id
+        private int order_id = 0;
+        // This stores the trade direction
+        private int trade_dir = 0;
+        // This defines the current volume for orders
+        private double volume_diff = 1;
+        // This stores the series of order placements
+        private HashMap<String, PricePoint> order_place_set = new HashMap<String, PricePoint>();
+        // This stores the set of prices
+        private Queue<ITick> price_queue = new LinkedList<ITick>();
+        // This stores the n most recent orders
+        private Queue<OrderSet> order_queue = new LinkedList<OrderSet>();
+        // This stores the set of stopped orders
+        private Queue<OrderSet> stopped_queue = new LinkedList<OrderSet>();
+        // This stores the set of stopped orders
+        private Queue<OrderSet> excess_queue = new LinkedList<OrderSet>();
+        // This stores the set of orders
+        private HashSet<OrderSet> orders = new HashSet<OrderSet>();
+        // This stores the number of active orders
+        private int active_order_num = 0;
+        private int order_set = 0;
+        
+        // This stores the previous pip value
+        private double prev_pip_val = -1;
+        // This stores the total profit since trading
+        private double total_profit = 0;
+        // This stores the exch rate factor 
+        private double exch_rate_fact = 1.0f;
+        // THis stores the open trade time
+        private double first_trade_time = 0;
+        // This stores the last trade time
+        private long last_trade_time = 0;
+        // This stores the net profi
+        private double net_profit = 0;
+        // This stores the start equity
+        private double start_equity;
+        
+        private double avg_time = 0;
+        private double max_profit;
+        private double min_profit;
+        private long trading_intv_time = 0;
+        
+        public OrderSystem(int order_set, Instrument instrument, int trade_dir) throws JFException {
+            this.order_set = order_set;
+            this.trade_dir = trade_dir;
+        }
+        
+
+        // This closes the order 
+        public void CloseOrder(OrderSet o) {
+            
+            if(o.is_close == false) {
+                active_order_num--;
+                o.is_close = true;
+            }
+            
+            orders.remove(o);
+            global_orders.remove(o);
+            order_queue.remove(o);
+           
+               if( o == null) {
+                   return;
+               }
+               
+            if ( o.order.getState() == IOrder.State.OPENED ||  o.order.getState() == IOrder.State.FILLED) {
+              
+                try {
+                     o.order.close();
+                     total_profit += o.order.getProfitLossInAccountCurrency();
+                } catch (JFException e) {
+                    // TODO Auto-generated catch block
+                    e.printStackTrace();
+                }
+            }
+        }
+        
+        // This makes an order
+        private void PlaceOrder(OrderSet o, double volume, Instrument instrument, ITick tick) throws JFException {
+
+            volume = Math.max(volume, 0.001);
+            
+            if(o.is_buy == false) {
+                o.order = engine.submitOrder("abeq"+String.valueOf(order_id++)+"dr"+String.valueOf(order_set), instrument, IEngine.OrderCommand.SELL, volume);
+            } else {
+                o.order = engine.submitOrder("abeq"+String.valueOf(order_id++)+"dr"+String.valueOf(order_set), instrument, IEngine.OrderCommand.BUY, volume);
+            }
+            
+            o.system = this;
+            global_orders.add(o);
+            active_order_num++;
+            order_queue.add(o);
+            if(order_queue.size() > 40) {
+                order_queue.remove();
+            }
+        }
+        
+        // This closes all orders
+        public void CloseAll() {
+            ArrayList<OrderSet> order_buff = new ArrayList<OrderSet>();
+            for(OrderSet o : orders) {
+                order_buff.add(o);
+            }
+            
+            for(OrderSet o : order_buff) {
+                CloseOrder(o);
+            }
+        }
+        
+        // This returns the total number of orders
+        public double TotalOrders() {
+            
+            double sum = 0;
+            for(OrderSet o : orders) {
+                sum += o.order.getAmount();
+            }
+            
+            return sum;
+        }
+        
+        // This finds the exchange rate factor
+        private void ExchRateFactor() {
+            
+            double sum = 0;
+            double num = 0;
+            for(OrderSet o : order_queue) {
+                if(Math.abs(o.order.getProfitLossInPips()) > 0) {
+                    sum += Math.abs(o.order.getProfitLossInUSD()) / (Math.abs(o.order.getProfitLossInPips()) * o.order.getAmount());
+                    num++;
+                }
+            }
+            
+            if(num == 0) { 
+                return;
+            }
+            
+            exch_rate_fact = 100 / (sum / num);
+        } 
+        
+        // This closes a particular order type
+        private boolean CloseOrderType(int dir, ITick tick, double move_ratio, boolean is_max_loss) throws JFException {
+            
+            long buy_time = 0;
+            long sell_time = 0;
+            double buy_profit = -Double.MAX_VALUE;
+            double sell_profit = -Double.MAX_VALUE;
+            
+            int buy_num = 0;
+            int sell_num = 0;
+            double net_buy_profit = 0;
+            double net_sell_profit = 0;
+            double pos_buy_profit = 0;
+            double neg_buy_profit = 0;
+            double min_buy_profit = 0;
+            double max_buy_profit = 0;
+            
+            double pos_sell_profit = 0;
+            double neg_sell_profit = 0;
+            double min_sell_profit = 0;
+            double buy_usd_profit = 0;
+            double sell_usd_profit = 0;
+            double max_sell_profit = 0;
+            
+            ArrayList<OrderSet> order_buff = new ArrayList<OrderSet>();
+            for(OrderSet o : orders) {
+                order_buff.add(o);
+                
+                o.max_pip_profit = Math.max(o.max_pip_profit, o.order.getProfitLossInPips());
+                o.min_pip_profit = Math.min(o.min_pip_profit, o.order.getProfitLossInPips());
+                
+                if(o.is_buy == true && o.order.getState() == IOrder.State.FILLED) {
+                    buy_profit = Math.max(buy_profit, o.order.getProfitLossInPips());
+                    buy_time = Math.max(buy_time, o.order.getFillTime());
+                    min_buy_profit = Math.min(min_buy_profit, o.order.getProfitLossInPips());
+                    max_buy_profit = Math.max(min_buy_profit, o.order.getProfitLossInPips());
+                    net_buy_profit += o.order.getProfitLossInPips() * o.order.getAmount();
+                    buy_usd_profit += o.order.getProfitLossInUSD();
+                    buy_num++;
+                    
+                    if(o.order.getProfitLossInPips() > 0) {
+                        pos_buy_profit += o.order.getProfitLossInPips() * o.order.getAmount();
+                    } else {
+                        neg_buy_profit += o.order.getProfitLossInPips() * o.order.getAmount();
+                    }
+                } 
+            
+                if(o.is_buy == false && o.order.getState() == IOrder.State.FILLED) {
+                    sell_profit = Math.max(sell_profit, o.order.getProfitLossInPips());
+                    sell_time = Math.max(sell_time, o.order.getFillTime());
+                    min_sell_profit = Math.min(min_sell_profit, o.order.getProfitLossInPips());
+                    max_sell_profit = Math.max(min_sell_profit, o.order.getProfitLossInPips());
+                    net_sell_profit += o.order.getProfitLossInPips() * o.order.getAmount();
+                    sell_usd_profit += o.order.getProfitLossInUSD();
+                    sell_num++;
+                    
+                    if(o.order.getProfitLossInPips() > 0) {
+                        pos_sell_profit += o.order.getProfitLossInPips() * o.order.getAmount();
+                    } else {
+                        neg_sell_profit += o.order.getProfitLossInPips() * o.order.getAmount();
+                    }
+                }
+            }
+            
+            max_buy_profit = Math.max(max_buy_profit, net_buy_profit);
+            max_sell_profit = Math.max(max_sell_profit, net_sell_profit);
+            
+            boolean is_close_buy = false;
+            boolean is_close_sell = false;
+            if(buy_num > 20 && (max_buy_profit / net_buy_profit) > (200 / buy_num) && net_buy_profit > 0) {
+                //is_close_buy = true;
+                max_buy_profit = 0;
+            }
+            
+            if(sell_num > 20 && (max_sell_profit / net_sell_profit) > (200 / sell_num) && net_sell_profit > 0) {
+                //is_close_sell = true;
+                max_sell_profit = 0;
+            }
+            
+            double ratio = 2;
+            boolean is_exposure = orders.size() > 300;
+            if(account.getUseOfLeverage() > 9) {
+                ratio = 1.01;
+            }
+
+            if((Math.abs(pos_sell_profit) / Math.max(1, Math.abs(neg_sell_profit))) > ratio && net_sell_profit > (Math.abs(pos_sell_profit) + Math.abs(neg_sell_profit)) * 0.01) {
+                is_close_sell = true;
+            }
+            
+            if((Math.abs(pos_buy_profit) / Math.max(1, Math.abs(neg_buy_profit))) > ratio && net_buy_profit > (Math.abs(pos_buy_profit) + Math.abs(neg_buy_profit)) * 0.01) {
+                is_close_buy = true;
+            }
+            
+            double factor = 1;
+            if(is_max_loss == false && account.getUseOfLeverage() > 5) {
+                //factor = Math.sqrt(Math.max(1, account.getUseOfLeverage()));
+            }
+            
+            if(buy_usd_profit < 400 * factor) { 
+                is_close_buy = false;
+            }
+        
+            if(sell_usd_profit < 400 * factor) {
+                is_close_sell = false;
+            }
+            
+
+            for(OrderSet o : order_buff) {
+                
+                if(o.order.getState() == IOrder.State.CANCELED) {
+                    CloseOrder(o);
+                    orders.remove(o);
+                    global_orders.remove(o);
+                    order_queue.remove(o);
+                    continue;
+                }
+                
+                if(o.order.getState() == IOrder.State.CLOSED) {
+                	continue;
+                }
+                
+                if(o.order.getProfitLossInPips() < -60) {
+                    o.order.close();
+                    stopped_queue.add(o);
+                    first_trade_time = o.trade_time;
+                    if(stopped_queue.size() > 50) {
+                    	OrderSet o1 = stopped_queue.remove();
+                    	orders.remove(o1);
+                    	global_orders.remove(o1);
+                    }
+                }
+                
+                if(Math.abs(o.order.getProfitLossInUSD()) > 1500 * (account.getEquity() / 14000) && o.order.getProfitLossInPips() < -100) {
+                    CloseOrder(o);
+                }
+                
+                
+                if(is_close_buy == true) {
+                    CloseOrder(o);
+                }
+                
+                if(is_close_sell == true) {
+                    CloseOrder(o);
+                }
+            }
+            
+
+            if(dir > 0) {
+                volume_diff = Math.max(Math.abs(neg_buy_profit), Math.abs(pos_buy_profit)) / Math.max(1, Math.min(Math.abs(neg_buy_profit), Math.abs(pos_buy_profit)));
+            }
+            
+            if(dir < 0) {
+                volume_diff = Math.max(Math.abs(neg_sell_profit), Math.abs(pos_sell_profit)) / Math.max(1, Math.min(Math.abs(neg_sell_profit), Math.abs(pos_sell_profit)));
+            }
+            
+            return true;
+        }
+      
+        
+        // This finds the maximum gradient
+        private double MaxGradient(Instrument instrument, double pip_val) throws JFException {
+            
+            double max_grad = 0;
+            for(int i=1; i<8; i++) {
+                IBar prev_bar = history.getBar(instrument,
+                        Period.ONE_HOUR,
+                        OfferSide.BID,
+                        i);
+                
+                double grad = Math.abs(pip_val - prev_bar.getOpen());
+                grad /= instrument.getPipValue();
+                
+                if(grad < 50) {
+                    grad = 0;
+                }
+                
+                grad /= i;
+                
+                if(prev_bar.getOpen() > pip_val) {
+                    grad = -grad;
+                }
+                
+                if(Math.abs(grad) > Math.abs(max_grad)) {
+                    max_grad = grad;
+                }
+            }
+            
+            return max_grad;
+        }
+        
+        // This returns the net gap
+        private double NetGap(double spread, int start, int end) {
+            
+            double pos_num = 0;
+            double neg_num = 0;
+            double net_pos_gap = 0;
+            double net_neg_gap = 0;
+            
+            double net_gap = 0;
+            min_profit = 0;
+            max_profit = -Double.MAX_VALUE;
+            double net_vol = 0;
+            avg_time = 0;
+            
+            for(OrderSet o : global_orders) {
+                net_vol += o.order.getAmount();
+            }
+            
+            net_profit = 0;
+            ArrayList<OrderSet> order_buff = new ArrayList<OrderSet>();
+            for(OrderSet o : orders) {
+                order_buff.add(o);
+            }
+            
+            for(int i=start; i<end; i++) {
+                
+                OrderSet o = order_buff.get(i);
+                if(o.order.getProfitLossInPips() < min_profit) {
+                    min_profit = o.order.getProfitLossInPips();
+                }
+
+                avg_time += Math.abs(o.order.getFillTime() - first_trade_time);
+                max_profit = Math.max(max_profit, o.order.getProfitLossInPips());
+                net_profit += o.order.getAmount() * (o.order.getProfitLossInPips() - spread);
+                double perc = o.order.getAmount() / net_vol;
+                
+                if(o.order.getProfitLossInPips() < 0  && Math.abs(o.order.getProfitLossInPips()) < 65) {
+                     net_neg_gap += Math.abs(o.order.getProfitLossInPips());
+                     neg_num++;
+                }
+                
+                if(o.order.getProfitLossInPips() > 0) {
+                     net_pos_gap += Math.abs(o.order.getProfitLossInPips());
+                     pos_num++;
+                }
+            }
+            
+            if(orders.size() > 0) {
+                avg_time /= orders.size();
+            }
+            
+            if(net_neg_gap > 0) {
+                net_neg_gap /= neg_num;
+            }
+
+            if(net_pos_gap > 0) {
+                net_pos_gap /= pos_num;
+            }
+            
+            net_gap = net_neg_gap;
+            
+            return net_gap;
+        }
+
+
+        // This initiates the position
+        private void InitPosition(ITick tick, Instrument instrument, boolean is_max_loss) throws JFException {
+            
+            double pip_val = (tick.getAsk() + tick.getBid()) / 2;
+            double spread = Math.abs(tick.getBid() - tick.getAsk()) / instrument.getPipValue();
+            
+            double net_gap = NetGap(spread, 0, orders.size());
+            
+            double dmi1[] = indicators.dmi(instrument,
+                    Period.ONE_HOUR,
+                    OfferSide.BID,
+                    48,
+                    0);
+
+            double dmi2[] = indicators.dmi(instrument,
+                    Period.ONE_HOUR,
+                    OfferSide.BID,
+                    10,
+                    0);
+            
+            double rsi = indicators.rsi(instrument,
+                       Period.DAILY,
+                       OfferSide.BID,
+                       IIndicators.AppliedPrice.CLOSE,
+                       14,
+                       0);
+                       
+
+            double rsi1 = indicators.rsi(instrument,
+                       Period.ONE_HOUR,
+                       OfferSide.BID,
+                       IIndicators.AppliedPrice.CLOSE,
+                       14,
+                       0);                       
+            
+            int dir = (Math.abs(dmi1[1]) > Math.abs(dmi1[2])) ? 1 : -1;
+            double move_ratio = Math.max(Math.abs(dmi2[1]), Math.abs(dmi2[2])) / Math.min(Math.abs(dmi2[1]), Math.abs(dmi2[2]));
+            double tsv = indicators.tvs(instrument, Period.ONE_HOUR, OfferSide.BID, IIndicators.AppliedPrice.CLOSE, 14, 0);
+            double adx = dmi1[0];
+            
+            double vwap = indicators.volumeWAP(instrument, Period.ONE_HOUR, OfferSide.BID, IIndicators.AppliedPrice.CLOSE, 48, 0);
+            double diff = (tick.getBid() - vwap) / instrument.getPipValue();
+            
+            double atr = indicators.atr(instrument,
+                    Period.DAILY,
+                    OfferSide.BID,
+                    14,
+                    0);
+
+            if(orders.size() == 0) {
+                order_place_set.clear();
+                first_trade_time = tick.getTime();
+                stopped_queue.clear();
+                excess_queue.clear();
+                start_equity = account.getEquity();
+                
+                if(account.getUseOfLeverage() > 5 || global_orders.size() > 300) {
+                    return;
+                }
+                
+                if(atr > 0.006 && dir != trade_dir) {// || atr > 0.0055) {
+                	return;
+                }
+                
+                
+            }
+
+            if(dir != trade_dir && move_ratio > 20) {
+                //return;
+            }
+            
+            if(Math.abs(trading_intv_time - tick.getTime()) < 1000 * 60 * 10) {
+                return;
+            }
+            
+            if(orders.size() > 0 && Math.abs(pip_val - prev_pip_val) < instrument.getPipValue() * move_ratio) {
+                return;
+            }
+
+            if((max_profit > Math.abs(diff) || account.getUseOfLeverage() > 40) && net_profit > 0 && Math.abs(tick.getTime() - first_trade_time) > 1000 * 60 * 60 * 12) {
+                CloseAll();
+                return;
+            }
+
+
+            System.out.println(account.getEquity()+"       "+global_orders.size()+"     "+account.getUseOfLeverage()+"   "+Math.abs(net_gap)+"    "+atr);
+            
+            if((trade_dir < 0) != (tick.getBid() > vwap)) {
+            	return;
+            }
+            
+            int sum = 0;
+            for(int v : dir_queue) {
+            	sum += v;
+            }
+            
+            if(Math.abs(sum) > dir_queue.size() * 0.75 && (sum > 0) == (trade_dir > 0) && dir_queue.size() > 10) {
+            	return;
+            }
+            
+            double vol_size = (account.getEquity() / 100000) * exch_rate_fact;
+            Integer price = (int) ((pip_val * 0.1) / instrument.getPipValue());
+            String val = String.valueOf(price);// + " " + String.valueOf((int)(account.getUseOfLeverage() * 2));
+            PricePoint last_order = order_place_set.get(val);
+            if(last_order != null && last_order.order_num > 0 && 
+                    Math.abs(tick.getTime() - last_order.order.trade_time) < 1000 * 60 * 60 * 10) {
+                return;
+            }
+            
+            if(spread > 3 || move_ratio > 30) {
+            	return;
+            }
+
+            OrderSet o = new OrderSet();
+            o.is_buy = trade_dir > 0;
+            o.price = pip_val;
+            o.volume = 0.000001 * vol_size;
+
+
+            o.volume *= Math.abs(net_gap);
+            o.volume *= Math.abs(diff);
+            o.volume *= Math.abs(diff);
+            o.volume *= Math.abs((1e-4) / atr);
+            o.volume *= orders.size();
+            o.volume *= Math.max(1, Math.abs(avg_time) * 10e-8);
+            o.volume *= move_ratio;
+            o.volume *= move_ratio;
+            o.volume = Math.max(o.volume, 0.001 * (account.getEquity() / 5000));
+            o.trade_time = tick.getTime();
+            
+            if(last_order != null) {
+                last_order.order_num++;
+                last_order.order = o;
+            } else {
+                last_order = new PricePoint(o, 1);
+            }
+            
+            order_place_set.put(val, last_order);
+
+            PlaceOrder(o, o.volume, instrument, tick);
+            prev_pip_val = pip_val;
+            trading_intv_time = tick.getTime();
+            orders.add(o);
+            excess_queue.add(o);
+            dir_queue.add(trade_dir);
+            if(dir_queue.size() > 20) {
+            	dir_queue.remove();
+            }
+            
+            if(excess_queue.size() > 10) {
+                OrderSet o1 = excess_queue.remove();
+                first_trade_time = o1.trade_time;
+                //order_num += Math.abs(o1.order.getProfitLossInPips());
+                
+                CloseOrder(o1);
+            }
+        }
+        
+        // This returns the net loss
+        public double NetLoss() {
+            
+            double net_profit = 0;
+            for(OrderSet o : orders) {
+                net_profit += o.order.getProfitLossInAccountCurrency();
+            }
+            
+            return net_profit;
+        }
+        
+        // This returns the total profit since trading
+        public double TotalProfit() {
+            return total_profit;
+        }
+       
+        // This finds the movement gradient
+        private double MovementGrad(Instrument instrument) {
+            
+            ArrayList<ITick> tick_buff = new ArrayList<ITick>();
+            for(ITick tick : price_queue) {
+                tick_buff.add(tick);
+            }
+            
+            int offset = 5;
+            double sum = 0;
+            double factor = 1.0f;
+            double net_grad = 0;
+            while(offset < tick_buff.size()) {
+                
+                int start = Math.max(0, tick_buff.size() - 1 - offset);
+                double grad = Math.abs(tick_buff.get(tick_buff.size()-1).getBid() - tick_buff.get(start).getBid());
+                grad /= Math.abs(tick_buff.get(tick_buff.size()-1).getTime() - tick_buff.get(start).getTime());
+                
+                if(tick_buff.get(tick_buff.size()-1).getBid() < tick_buff.get(start).getBid()) {
+                    grad = -grad;
+                }
+                
+                net_grad += grad * factor;
+                sum += factor;
+                factor *= 0.95;
+                offset <<= 1;
+            }
+            
+            return net_grad / sum;
+        }
+        
+        // This processes the current tick
+        public void ProcessTick(ITick tick, Instrument instrument, boolean is_max_loss) throws JFException {
+            
+            if(account.getUseOfLeverage() > 180) {
+                //CloseAll();
+            }
+            
+            double pip_val = 0;
+            if(trade_dir > 0) {
+                pip_val = tick.getAsk();
+            } else {
+                pip_val = tick.getBid();
+            }
+            
+            price_queue.add(tick);
+            if(price_queue.size() > 1000) {
+                price_queue.remove();
+            }
+
+            if(orders.size() == 0 && Math.abs(tick.getTime() - last_trade_time) < 1000 * 60 * 1 * (Math.abs(pip_val - prev_pip_val) / instrument.getPipValue())) {
+                //return;
+            }
+
+            CloseOrderType(trade_dir, tick, 10, is_max_loss);
+
+            last_trade_time = tick.getTime();
+            ExchRateFactor();
+            InitPosition(tick, instrument, is_max_loss);
+            prev_pip_val = pip_val;
+        }
+   }
+   
+   // This stores the set of instruments 
+   private HashMap<String, OrderSystem> sys_map = new HashMap<String, OrderSystem>();
+   // This stores the set of instruments
+   private ArrayList<OrderSystem> inst_buff = new ArrayList<OrderSystem>();
+   // This stores the set of global orders
+   private static HashSet<OrderSet> global_orders = new HashSet<OrderSet>();
+   // This stores the account equity
+   private ArrayList<Double> equity_buff = new ArrayList<Double>();
+   // This stores the previous order refresh time
+   private long prev_refresh_time = 0;
+
+   public HFTStrategy() throws IOException, ParseException, JFException {
+
+   }
+   
+   public void onStart(final IContext context) throws JFException {
+       
+       this.engine = context.getEngine();
+       this.console = context.getConsole();
+       this.history = context.getHistory();
+       this.context = context;
+       this.indicators = context.getIndicators();
+       this.userInterface = context.getUserInterface();
+       this.con = context.getConsole();
+       this.account = context.getAccount();
+       
+       curr_equity = account.getEquity();
+       
+       // NOT USDNZD
+       //Instrument inst[] = new Instrument[]{Instrument.USDCHF, Instrument.NZDUSD, Instrument.AUDCHF};
+       Instrument inst[] = new Instrument[]{Instrument.NZDUSD};
+       
+
+       //subscribe an instrument:
+       Set<Instrument> instruments = new HashSet<Instrument>();
+       
+       int count = 0;
+       for(int i=0; i<inst.length; i++) {
+           instruments.add(inst[i]);    
+           OrderSystem o = new OrderSystem(count, inst[i], 1);
+           inst_buff.add(o);  
+           count++;
+           
+           String str = inst[i]+" 1";
+           sys_map.put(str, o);
+
+           str = inst[i]+" 0";
+           o = new OrderSystem(count, inst[i], -1);
+           inst_buff.add(o);  
+           sys_map.put(str, o);
+           count++;
+       }  
+       
+                  
+       context.setSubscribedInstruments(instruments, true);  
+
+   }
+
+   public void onAccount(IAccount account) throws JFException {
+   }
+
+   public void onMessage(IMessage message) throws JFException {
+   }
+
+   public void onStop() throws JFException {
+       console.getOut().println("Stopped "+account.getEquity());
+       
+       PrintWriter pw = null;
+       try {
+           pw = new PrintWriter(new File("test.txt"));
+           for(int i=0; i<equity_buff.size(); i++) {
+               
+               pw.println(equity_buff.get(i));
+           }
+           pw.close();
+           
+       } catch (FileNotFoundException e) {
+           // TODO Auto-generated catch block
+           e.printStackTrace();
+       }
+   }
+   
+
+   public void onTick(Instrument instrument, ITick tick) throws JFException {
+ 
+       
+       //CloseOutstanding();
+       curr_equity = Math.max(curr_equity, account.getEquity());
+       
+       for(int i=0; i<2; i++) {
+           OrderSystem o = sys_map.get(instrument+" "+i);
+           if(o == null) {
+               continue;
+           }
+           
+           if(Math.abs(tick.getTime() - prev_refresh_time) > 1000000) {
+               prev_refresh_time = tick.getTime();
+               HashSet<IOrder> map = new HashSet<IOrder>();
+               for(OrderSet o1 : global_orders) {
+                      map.add(o1.order);
+               }
+                   
+               for(IOrder o1 : engine.getOrders()) {
+                      if(map.contains(o1) == false) {
+                          o1.close();
+                      } 
+               }
+           }
+           
+           if(Math.abs(prev_equity_time - tick.getTime()) > 1000 * 60 * 60 * 24) {
+               equity_buff.add(account.getEquity());
+               prev_equity_time = tick.getTime();
+           }
+          
+           OrderSystem max_o = null;
+           double max_loss = 0;
+           for(OrderSystem o1 : inst_buff) {
+               double loss = Math.abs(o1.NetLoss());
+               if(loss > max_loss) {
+                   max_loss = loss;
+                   max_o = o1;
+               }
+           }
+           
+           for(OrderSystem o1 : inst_buff) {
+               //System.out.print(o1.TotalProfit()+" ");
+           }
+           
+           //System.out.println("");
+          
+           o.ProcessTick(tick, instrument, o == max_o);
+       }
+       
+   }
+   
+   public void onBar(Instrument instrument, Period period, IBar askBar, IBar bidBar) throws JFException {
+   }
+}
+                
+  
+                 
+             
+  
